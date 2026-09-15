@@ -1,0 +1,18 @@
+{
+  "name": "pi-more-keys",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Generic pi extension: multi-key failover pools with persisted state for any api_key provider",
+  "type": "module",
+  "scripts": {
+    "build": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "^0.85.1",
+    "@earendil-works/pi-coding-agent": "^0.85.1",
+    "@types/node": "^22.10.0",
+    "typescript": "^5.6.0",
+    "vitest": "^2.1.0"
+  }
+}
