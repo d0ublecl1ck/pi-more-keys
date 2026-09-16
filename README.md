@@ -1,6 +1,6 @@
 # pi-more-keys
 
-零配置多 key 故障切换 [pi](https://github.com/earendil-works/pi-mono) extension。加 provider 的方式完全不变（`models.json` + `/login`），只要执行一句 `/add-more-key my-kimi` 粘贴备用 key，这个 provider 就获得多 key 自动故障切换，切换状态持久化，pi 重启后不会再先打失败的 key。
+零配置多 key 故障切换 [pi](https://github.com/earendil-works/pi-mono) extension。加 provider 的方式完全不变（`models.json` + `/login`），只要执行一句 `/add-more-key` 粘贴备用 key，当前正在用的 provider 就获得多 key 自动故障切换，切换状态持久化，pi 重启后不会再先打失败的 key。
 
 ## 使用
 
@@ -12,18 +12,19 @@ ln -s /path/to/pi-more-keys ~/.pi/agent/extensions/pi-more-keys
 然后在 pi 里：
 
 ```
-/add-more-key my-kimi      # 弹窗粘贴备用 key（不会进入会话历史）
+/add-more-key              # 给当前会话正在用的 provider 加备用 key（弹窗粘贴，不进会话历史）
+/add-more-key my-kimi      # 或显式指定 provider（覆盖手段）
 /more-keys                 # 查看：my-kimi: 2 keys, active=#0
 /more-keys-reset my-kimi   # 清失败记录，切回原 key
 ```
 
-就这么多。没有要手写的配置文件。
+就这么多。没有要手写的配置文件。未选模型时 `/add-more-key`（无参数）会提示先用 `/model` 选模型。
 
 要求 pi ≥ 0.85.1。
 
 ## 工作原理
 
-- `/add-more-key` 校验：provider 存在 → 其 api 可被 pi-ai 分发 → 原 key 可解析（`/login` 或 models.json `apiKey`）；任一不满足会明确提示原因且不写任何文件。
+- `/add-more-key` 校验：provider 存在（无参数时取当前会话模型的 provider）→ 其 api 可被 pi-ai 分发 → 原 key 可解析（`/login` 或 models.json `apiKey`）；任一不满足会明确提示原因且不写任何文件。
 - 备用 key 追加到 `~/.pi/agent/pi-more-keys.json`（0600），并立即对运行中的会话生效。
 - extension 对有备用 key 的 provider 用 `pi.registerProvider()` **只覆盖 streamSimple**（merge 语义，models.json 的 models/baseUrl 原样保留）。
 - 请求进来 → 用 active key 打原 endpoint（key 列表 = 原 key + extraKeys，同 provider 同 endpoint，只换 key）。
@@ -58,7 +59,7 @@ active key 与失败记录存 `~/.pi/agent/pi-more-keys-state.json`（原子写�
 
 | 命令 | 作用 |
 |---|---|
-| `/add-more-key <provider-id>` | 弹窗收一个备用 key 加入该 provider 的 key 池，立即生效 |
+| `/add-more-key [provider-id]` | 弹窗收一个备用 key 加入 key 池，立即生效；不带参数时作用于当前会话模型的 provider |
 | `/more-keys` | 各 provider 的 key 数量、当前 active 序号、失败记录 |
 | `/more-keys-reset <provider-id>` | 清失败记录并切回原 key（#0） |
 

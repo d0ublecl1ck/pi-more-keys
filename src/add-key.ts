@@ -13,15 +13,18 @@
  */
 
 export interface AddKeyFlowDeps {
+	/** Raw command argument. Empty means "use the current session model's provider". */
 	providerId: string;
+	/** Current session model's provider id (ctx.model?.provider), or undefined when no model is selected. */
+	getCurrentProvider: () => string | undefined;
 	/** Resolve the provider's api id, or undefined when the provider is unknown / has no models. */
 	getProviderApi: (providerId: string) => string | undefined;
 	/** Whether pi-ai compat can dispatch this api (getApiProvider(api) !== undefined). */
 	isApiDispatchable: (api: string) => boolean;
 	/** Resolve the provider's original key, or undefined when none is configured. */
 	getOriginalKey: (providerId: string) => Promise<string | undefined>;
-	/** Prompt for the new key (UI input dialog). */
-	promptKey: () => Promise<string | undefined>;
+	/** Prompt for the new key (UI input dialog). Receives the resolved provider id. */
+	promptKey: (providerId: string) => Promise<string | undefined>;
 	/** Extra keys already pooled for this provider. */
 	getExtraKeys: (providerId: string) => string[];
 	/** Persist an extra key into the pool (0600 file). */
@@ -40,10 +43,18 @@ export interface AddKeyFlowResult {
 }
 
 export async function runAddKeyFlow(deps: AddKeyFlowDeps): Promise<AddKeyFlowResult> {
-	const providerId = deps.providerId.trim();
+	let providerId = deps.providerId.trim();
 	if (!providerId) {
-		deps.notify("usage: /add-more-key <provider-id>", "warning");
-		return { added: false, reason: "usage" };
+		// No argument: default to the provider of the model this session is using.
+		const current = deps.getCurrentProvider();
+		if (!current) {
+			deps.notify(
+				"pi-more-keys: no model selected. Pick one with /model first, or run /add-more-key <provider-id>.",
+				"warning",
+			);
+			return { added: false, reason: "no-current-provider" };
+		}
+		providerId = current;
 	}
 
 	const api = deps.getProviderApi(providerId);
@@ -72,7 +83,7 @@ export async function runAddKeyFlow(deps: AddKeyFlowDeps): Promise<AddKeyFlowRes
 		return { added: false, reason: "no-original-key" };
 	}
 
-	const input = await deps.promptKey();
+	const input = await deps.promptKey(providerId);
 	const key = input?.trim();
 	if (!key) {
 		deps.notify("pi-more-keys: cancelled (no key entered)", "info");

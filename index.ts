@@ -17,7 +17,8 @@
  * records key INDICES only.
  *
  * Commands:
- *   /add-more-key <provider-id>   pool an extra key (prompted via UI dialog)
+ *   /add-more-key [provider-id]   pool an extra key (prompted via UI dialog);
+ *                                 no argument = current model's provider
  *   /more-keys                    show key counts, active key index, failures
  *   /more-keys-reset <provider>   clear failure records, switch back to key #0
  */
@@ -145,18 +146,19 @@ export default async function piMoreKeys(pi: ExtensionAPI): Promise<void> {
 	});
 
 	pi.registerCommand("add-more-key", {
-		description: "Pool an extra API key for a provider (failover): /add-more-key <provider-id>",
+		description: "Pool an extra API key for a provider (failover). No argument = current model's provider: /add-more-key [provider-id]",
 		handler: async (args, ctx) => {
 			await runAddKeyFlow({
 				providerId: args,
+				getCurrentProvider: () => ctx.model?.provider,
 				getProviderApi: (id) => apiFromRegistry(ctx, id),
 				isApiDispatchable: (api) => getApiProvider(api as Api) !== undefined,
 				getOriginalKey: (id) => ctx.modelRegistry.getApiKeyForProvider(id),
 				// Key is collected via UI dialog, never from command args, so it
 				// does not end up in session history.
-				promptKey: () =>
+				promptKey: (providerId) =>
 					ctx.ui.input(
-						`Add extra API key for ${args.trim()}`,
+						`Add extra API key for ${providerId}`,
 						"paste the key — stored in pi-more-keys.json (0600), never logged",
 					),
 				getExtraKeys: (id) => store.getEntry(id)?.extraKeys ?? [],

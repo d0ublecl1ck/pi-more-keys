@@ -35,6 +35,7 @@ function makeHarness(overrides?: Partial<AddKeyFlowDeps>): Harness {
 	const overridesMade: Harness["overrides"] = [];
 	const deps: AddKeyFlowDeps = {
 		providerId: "my-provider",
+		getCurrentProvider: () => "current-provider",
 		getProviderApi: () => "openai-completions",
 		isApiDispatchable: () => true,
 		getOriginalKey: async () => ORIGINAL_KEY,
@@ -76,11 +77,28 @@ describe("runAddKeyFlow: validation rejections write nothing", () => {
 		expect(h.store.providers).toEqual({});
 	});
 
-	it("rejects empty provider id with usage", async () => {
-		const h = makeHarness({ providerId: "  " });
+	it("rejects empty provider id with no current model selected", async () => {
+		const h = makeHarness({ providerId: "  ", getCurrentProvider: () => undefined });
 		const result = await runAddKeyFlow(h.deps);
-		expect(result).toEqual({ added: false, reason: "usage" });
+		expect(result).toEqual({ added: false, reason: "no-current-provider" });
+		expect(h.notifications.at(-1)?.message).toContain("/model");
 		expect(h.store.providers).toEqual({});
+	});
+
+	it("no argument defaults to the current session model's provider", async () => {
+		const h = makeHarness({ providerId: "", getCurrentProvider: () => "current-provider" });
+		const result = await runAddKeyFlow(h.deps);
+		expect(result).toEqual({ added: true, keyCount: 2 });
+		expect(h.store.getEntry("current-provider")?.extraKeys).toEqual([NEW_KEY]);
+		expect(h.overrides).toEqual([{ providerId: "current-provider", api: "openai-completions" }]);
+	});
+
+	it("an explicit argument overrides the current provider", async () => {
+		const h = makeHarness({ providerId: "other-provider", getCurrentProvider: () => "current-provider" });
+		const result = await runAddKeyFlow(h.deps);
+		expect(result).toEqual({ added: true, keyCount: 2 });
+		expect(h.store.getEntry("other-provider")?.extraKeys).toEqual([NEW_KEY]);
+		expect(h.store.getEntry("current-provider")).toBeUndefined();
 	});
 
 	it("never prompts for a key when validation fails", async () => {
