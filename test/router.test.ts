@@ -12,13 +12,18 @@ import {
 	createAssistantMessageEventStream,
 } from "@earendil-works/pi-ai";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import type { TriggerConfig } from "../src/config.ts";
-import { createPoolStreamSimple, type PoolMember, type RouterPool } from "../src/router.ts";
+import type { PoolFileEntry, TriggerConfig } from "../src/pool-file.ts";
+import { createKeyPoolStream } from "../src/router.ts";
 import { StateStore } from "../src/state.ts";
 
 // ---------------------------------------------------------------------------
 // Test fixtures. All "keys" here are fake sentinel strings, never real keys.
 // ---------------------------------------------------------------------------
+
+const PROVIDER_ID = "test-provider";
+const ORIGINAL_KEY = "test-key-original";
+const EXTRA_KEY_1 = "test-key-extra-1";
+const EXTRA_KEY_2 = "test-key-extra-2";
 
 const TRIGGER: TriggerConfig = {
 	httpStatuses: [401, 429, 500],
@@ -26,17 +31,17 @@ const TRIGGER: TriggerConfig = {
 	caseInsensitive: true,
 };
 
-const MEMBER_A: PoolMember = { id: "member-a", apiKey: "test-key-alpha", baseUrl: "https://a.example.com/v1", api: "openai-completions" };
-const MEMBER_B: PoolMember = { id: "member-b", apiKey: "test-key-beta", baseUrl: "https://b.example.com/v1", api: "openai-completions" };
-const MEMBER_C: PoolMember = { id: "member-c", apiKey: "test-key-gamma", baseUrl: "https://c.example.com/v1", api: "openai-completions" };
+function makeEntry(extraKeys: string[] = [EXTRA_KEY_1]): PoolFileEntry {
+	return { extraKeys, trigger: TRIGGER };
+}
 
-function routerModel(): Model<Api> {
+function testModel(): Model<Api> {
 	return {
-		id: "routed-model",
-		name: "Routed Model",
+		id: "some-model",
+		name: "Some Model",
 		api: "openai-completions",
-		provider: "test-router",
-		baseUrl: "https://a.example.com/v1",
+		provider: PROVIDER_ID,
+		baseUrl: "https://api.example.com/v1",
 		reasoning: false,
 		input: ["text"],
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
@@ -47,13 +52,13 @@ function routerModel(): Model<Api> {
 
 const CONTEXT: Context = { messages: [] };
 
-function makeMessage(provider: string, overrides?: Partial<AssistantMessage>): AssistantMessage {
+function makeMessage(overrides?: Partial<AssistantMessage>): AssistantMessage {
 	return {
 		role: "assistant",
 		content: [],
 		api: "openai-completions",
-		provider,
-		model: "routed-model",
+		provider: PROVIDER_ID,
+		model: "some-model",
 		usage: {
 			input: 0,
 			output: 0,
@@ -76,6 +81,8 @@ type Script =
 
 interface DispatchCall {
 	provider: string;
+	baseUrl: string;
+	api: string;
 	apiKey: string | undefined;
 	maxRetries: number | undefined;
 }
@@ -83,14 +90,20 @@ interface DispatchCall {
 /** Build a dispatch fake that plays one script per call, in order. */
 function fakeDispatch(scripts: Script[], calls: DispatchCall[]) {
 	return (model: Model<Api>, _context: Context, options?: SimpleStreamOptions): AssistantMessageEventStream => {
-		calls.push({ provider: model.provider, apiKey: options?.apiKey, maxRetries: options?.maxRetries });
+		calls.push({
+			provider: model.provider,
+			baseUrl: model.baseUrl,
+			api: model.api,
+			apiKey: options?.apiKey,
+			maxRetries: options?.maxRetries,
+		});
 		const script = scripts.length > 1 ? scripts.shift()! : scripts[0]!;
 		const stream = createAssistantMessageEventStream();
 		queueMicrotask(() => {
 			if (script.kind !== "aborted" && "status" in script && script.status !== undefined) {
 				void options?.onResponse?.({ status: script.status, headers: {} }, model);
 			}
-			const partial = makeMessage(model.provider);
+			const partial = makeMessage();
 			if (script.kind === "success") {
 				stream.push({ type: "start", partial });
 				stream.push({ type: "text_start", contentIndex: 0, partial });
@@ -102,7 +115,7 @@ function fakeDispatch(scripts: Script[], calls: DispatchCall[]) {
 				stream.push({
 					type: "error",
 					reason: "error",
-					error: makeMessage(model.provider, { stopReason: "error", errorMessage: script.message }),
+					error: makeMessage({ stopReason: "error", errorMessage: script.message }),
 				});
 			} else if (script.kind === "postContentError") {
 				stream.push({ type: "start", partial });
@@ -111,14 +124,14 @@ function fakeDispatch(scripts: Script[], calls: DispatchCall[]) {
 				stream.push({
 					type: "error",
 					reason: "error",
-					error: makeMessage(model.provider, { stopReason: "error", errorMessage: script.message }),
+					error: makeMessage({ stopReason: "error", errorMessage: script.message }),
 				});
 			} else {
 				stream.push({ type: "start", partial });
 				stream.push({
 					type: "error",
 					reason: "aborted",
-					error: makeMessage(model.provider, { stopReason: "aborted", errorMessage: "aborted" }),
+					error: makeMessage({ stopReason: "aborted", errorMessage: "aborted" }),
 				});
 			}
 			stream.end();
@@ -148,127 +161,144 @@ afterEach(() => {
 	rmSync(dir, { recursive: true, force: true });
 });
 
-function makePool(overrides?: Partial<RouterPool>): RouterPool {
-	return {
-		id: "test-router",
-		members: [MEMBER_A, MEMBER_B],
-		trigger: TRIGGER,
-		maxAlternateAttempts: 1,
-		...overrides,
-	};
+function makeRouter(
+	scripts: Script[],
+	calls: DispatchCall[],
+	entry: PoolFileEntry | undefined = makeEntry(),
+	state?: StateStore,
+) {
+	return createKeyPoolStream({
+		providerId: PROVIDER_ID,
+		getEntry: () => entry,
+		state: state ?? new StateStore(statePath),
+		dispatch: fakeDispatch(scripts, calls),
+	});
 }
 
 describe("router: happy path", () => {
-	it("serves the request with the active member and forwards the stream", async () => {
+	it("serves the request with the original key (index 0) and forwards the stream", async () => {
 		const calls: DispatchCall[] = [];
 		const state = new StateStore(statePath);
-		const stream = createPoolStreamSimple({ pool: makePool(), state, dispatch: fakeDispatch([{ kind: "success", status: 200 }], calls) });
-		const events = collect(stream(routerModel(), CONTEXT, undefined));
+		const stream = makeRouter([{ kind: "success", status: 200 }], calls, makeEntry(), state);
+		const events = await collect(stream(testModel(), CONTEXT, { apiKey: ORIGINAL_KEY }));
 
-		expect((await events).map((e) => e.type)).toEqual(["start", "text_start", "text_delta", "text_end", "done"]);
+		expect(events.map((e) => e.type)).toEqual(["start", "text_start", "text_delta", "text_end", "done"]);
 		expect(calls).toHaveLength(1);
-		expect(calls[0]).toEqual({ provider: "member-a", apiKey: "test-key-alpha", maxRetries: 0 });
-		// No failover happened: state file untouched.
-		expect(state.getPool("test-router")).toEqual({ failed: {} });
+		expect(calls[0]).toMatchObject({ apiKey: ORIGINAL_KEY, maxRetries: 0 });
+		expect(state.getProvider(PROVIDER_ID)).toEqual({ failed: {} });
+	});
+
+	it("keeps provider/baseUrl/api identical across attempts — only the key changes", async () => {
+		const calls: DispatchCall[] = [];
+		const stream = makeRouter(
+			[
+				{ kind: "preContentError", status: 429, message: "nope" },
+				{ kind: "success" },
+			],
+			calls,
+		);
+		await collect(stream(testModel(), CONTEXT, { apiKey: ORIGINAL_KEY }));
+		expect(calls).toHaveLength(2);
+		for (const call of calls) {
+			expect(call.provider).toBe(PROVIDER_ID);
+			expect(call.baseUrl).toBe("https://api.example.com/v1");
+			expect(call.api).toBe("openai-completions");
+			expect(call.maxRetries).toBe(0);
+		}
+		expect(calls.map((c) => c.apiKey)).toEqual([ORIGINAL_KEY, EXTRA_KEY_1]);
 	});
 });
 
 describe("router: failover", () => {
-	it("fails over on trigger status before content, persists the switch", async () => {
+	it("fails over on trigger status before content and persists the switch by index", async () => {
 		const calls: DispatchCall[] = [];
 		const state = new StateStore(statePath);
-		const stream = createPoolStreamSimple({
-			pool: makePool(),
-			state,
-			dispatch: fakeDispatch([
+		const stream = makeRouter(
+			[
 				{ kind: "preContentError", status: 429, message: "too many requests" },
 				{ kind: "success", status: 200 },
-			], calls),
-		});
-		const events = await collect(stream(routerModel(), CONTEXT, undefined));
+			],
+			calls,
+			makeEntry(),
+			state,
+		);
+		const events = await collect(stream(testModel(), CONTEXT, { apiKey: ORIGINAL_KEY }));
 
 		// Only the second attempt's events are visible: exactly one start.
 		expect(events.map((e) => e.type)).toEqual(["start", "text_start", "text_delta", "text_end", "done"]);
-		expect(calls.map((c) => c.provider)).toEqual(["member-a", "member-b"]);
-		expect(calls.map((c) => c.apiKey)).toEqual(["test-key-alpha", "test-key-beta"]);
-		expect(calls.every((c) => c.maxRetries === 0)).toBe(true);
+		expect(calls.map((c) => c.apiKey)).toEqual([ORIGINAL_KEY, EXTRA_KEY_1]);
 
-		const persisted = state.getPool("test-router");
-		expect(persisted.active).toBe("member-b");
-		expect(persisted.failed["member-a"]?.reason).toBe("429");
+		const persisted = state.getProvider(PROVIDER_ID);
+		expect(persisted.active).toBe(1);
+		expect(persisted.failed["0"]?.reason).toBe("429");
 	});
 
 	it("fails over on error keyword match", async () => {
 		const calls: DispatchCall[] = [];
 		const state = new StateStore(statePath);
-		const stream = createPoolStreamSimple({
-			pool: makePool(),
-			state,
-			dispatch: fakeDispatch([
+		const stream = makeRouter(
+			[
 				{ kind: "preContentError", message: "Rate Limit reached for account" },
 				{ kind: "success" },
-			], calls),
-		});
-		const events = await collect(stream(routerModel(), CONTEXT, undefined));
+			],
+			calls,
+			makeEntry(),
+			state,
+		);
+		const events = await collect(stream(testModel(), CONTEXT, { apiKey: ORIGINAL_KEY }));
 		expect(events.at(-1)?.type).toBe("done");
-		expect(calls.map((c) => c.provider)).toEqual(["member-a", "member-b"]);
-		expect(state.getPool("test-router").active).toBe("member-b");
-		expect(state.getPool("test-router").failed["member-a"]?.reason).toBe('keyword:"rate limit"');
+		expect(calls.map((c) => c.apiKey)).toEqual([ORIGINAL_KEY, EXTRA_KEY_1]);
+		expect(state.getProvider(PROVIDER_ID).active).toBe(1);
+		expect(state.getProvider(PROVIDER_ID).failed["0"]?.reason).toBe('keyword:"rate limit"');
 	});
 
-	it("resumes from persisted active member across a simulated restart", async () => {
+	it("resumes from the persisted active key across a simulated restart", async () => {
 		const state = new StateStore(statePath);
 		state.update((data) => {
-			data.pools["test-router"] = { active: "member-b", failed: { "member-a": { reason: "429", at: 1 } } };
+			data.providers[PROVIDER_ID] = { active: 1, failed: { "0": { reason: "429", at: 1 } } };
 		});
 
-		// "Restart": brand-new router instance sharing the same state file.
+		// "Restart": brand-new router sharing the same state file.
 		const calls: DispatchCall[] = [];
-		const stream = createPoolStreamSimple({
-			pool: makePool(),
-			state: new StateStore(statePath),
-			dispatch: fakeDispatch([{ kind: "success" }], calls),
-		});
-		await collect(stream(routerModel(), CONTEXT, undefined));
-		expect(calls.map((c) => c.provider)).toEqual(["member-b"]);
-
-		// A recovering member clears its own stale failure record on success.
-		expect(state.getPool("test-router").failed["member-b"]).toBeUndefined();
+		const stream = makeRouter([{ kind: "success" }], calls, makeEntry(), new StateStore(statePath));
+		await collect(stream(testModel(), CONTEXT, { apiKey: ORIGINAL_KEY }));
+		expect(calls.map((c) => c.apiKey)).toEqual([EXTRA_KEY_1]);
 	});
 
-	it("tries members in config priority order and stops at maxAlternateAttempts", async () => {
+	it("walks all pooled keys in order until one succeeds", async () => {
 		const calls: DispatchCall[] = [];
 		const state = new StateStore(statePath);
-		const pool = makePool({ members: [MEMBER_A, MEMBER_B, MEMBER_C], maxAlternateAttempts: 2 });
-		const stream = createPoolStreamSimple({
-			pool,
-			state,
-			dispatch: fakeDispatch([
-				{ kind: "preContentError", status: 500, message: "boom-a" },
-				{ kind: "preContentError", status: 500, message: "boom-b" },
+		const stream = makeRouter(
+			[
+				{ kind: "preContentError", status: 500, message: "boom-0" },
+				{ kind: "preContentError", status: 500, message: "boom-1" },
 				{ kind: "success" },
-			], calls),
-		});
-		const events = await collect(stream(routerModel(), CONTEXT, undefined));
+			],
+			calls,
+			makeEntry([EXTRA_KEY_1, EXTRA_KEY_2]),
+			state,
+		);
+		const events = await collect(stream(testModel(), CONTEXT, { apiKey: ORIGINAL_KEY }));
 		expect(events.at(-1)?.type).toBe("done");
-		expect(calls.map((c) => c.provider)).toEqual(["member-a", "member-b", "member-c"]);
-		expect(state.getPool("test-router").active).toBe("member-c");
+		expect(calls.map((c) => c.apiKey)).toEqual([ORIGINAL_KEY, EXTRA_KEY_1, EXTRA_KEY_2]);
+		expect(state.getProvider(PROVIDER_ID).active).toBe(2);
 	});
 
-	it("maxAlternateAttempts: 0 means the active member is the only attempt", async () => {
+	it("uses extra keys added mid-session (live pool entry)", async () => {
 		const calls: DispatchCall[] = [];
 		const state = new StateStore(statePath);
-		const stream = createPoolStreamSimple({
-			pool: makePool({ maxAlternateAttempts: 0 }),
+		const entry = makeEntry([]);
+		const stream = createKeyPoolStream({
+			providerId: PROVIDER_ID,
+			getEntry: () => entry,
 			state,
-			dispatch: fakeDispatch([{ kind: "preContentError", status: 429, message: "nope" }], calls),
+			dispatch: fakeDispatch([{ kind: "preContentError", status: 429, message: "original fails" }, { kind: "success" }], calls),
 		});
-		const events = await collect(stream(routerModel(), CONTEXT, undefined));
-		expect(events.at(-1)?.type).toBe("error");
-		expect(calls).toHaveLength(1);
-		// The failure is still recorded even without a retry.
-		expect(state.getPool("test-router").failed["member-a"]?.reason).toBe("429");
-		expect(state.getPool("test-router").active).toBeUndefined();
+		// Key added after the extension started, before this request.
+		entry.extraKeys.push(EXTRA_KEY_1);
+		const events = await collect(stream(testModel(), CONTEXT, { apiKey: ORIGINAL_KEY }));
+		expect(events.at(-1)?.type).toBe("done");
+		expect(calls.map((c) => c.apiKey)).toEqual([ORIGINAL_KEY, EXTRA_KEY_1]);
 	});
 });
 
@@ -276,95 +306,95 @@ describe("router: no-retry rules", () => {
 	it("never retries after partial output, even on trigger status", async () => {
 		const calls: DispatchCall[] = [];
 		const state = new StateStore(statePath);
-		const stream = createPoolStreamSimple({
-			pool: makePool(),
+		const stream = makeRouter(
+			[{ kind: "postContentError", status: 429, message: "mid-stream 429" }],
+			calls,
+			makeEntry(),
 			state,
-			dispatch: fakeDispatch([{ kind: "postContentError", status: 429, message: "mid-stream 429" }], calls),
-		});
-		const events = await collect(stream(routerModel(), CONTEXT, undefined));
+		);
+		const events = await collect(stream(testModel(), CONTEXT, { apiKey: ORIGINAL_KEY }));
 
 		expect(events.map((e) => e.type)).toEqual(["start", "text_start", "text_delta", "error"]);
 		expect(calls).toHaveLength(1);
-		expect(state.getPool("test-router").active).toBeUndefined();
-		expect(state.getPool("test-router").failed).toEqual({});
+		expect(state.getProvider(PROVIDER_ID).active).toBeUndefined();
+		expect(state.getProvider(PROVIDER_ID).failed).toEqual({});
 	});
 
-	it("does not retry non-trigger errors and does not mark the member failed", async () => {
+	it("does not retry non-trigger errors and does not mark the key failed", async () => {
 		const calls: DispatchCall[] = [];
 		const state = new StateStore(statePath);
-		const stream = createPoolStreamSimple({
-			pool: makePool(),
+		const stream = makeRouter(
+			[{ kind: "preContentError", status: 400, message: "context_length_exceeded: too big" }],
+			calls,
+			makeEntry(),
 			state,
-			dispatch: fakeDispatch([{ kind: "preContentError", status: 400, message: "context_length_exceeded: too big" }], calls),
-		});
-		const events = await collect(stream(routerModel(), CONTEXT, undefined));
+		);
+		const events = await collect(stream(testModel(), CONTEXT, { apiKey: ORIGINAL_KEY }));
 
 		const last = events.at(-1);
 		expect(last?.type).toBe("error");
 		expect(last && "error" in last ? last.error.errorMessage : "").toContain("context_length_exceeded");
 		expect(calls).toHaveLength(1);
-		expect(state.getPool("test-router").failed).toEqual({});
+		expect(state.getProvider(PROVIDER_ID).failed).toEqual({});
 	});
 
 	it("does not retry aborted streams", async () => {
 		const calls: DispatchCall[] = [];
 		const state = new StateStore(statePath);
-		const stream = createPoolStreamSimple({
-			pool: makePool(),
-			state,
-			dispatch: fakeDispatch([{ kind: "aborted" }], calls),
-		});
-		const events = await collect(stream(routerModel(), CONTEXT, undefined));
+		const stream = makeRouter([{ kind: "aborted" }], calls, makeEntry(), state);
+		const events = await collect(stream(testModel(), CONTEXT, { apiKey: ORIGINAL_KEY }));
 		expect(events.at(-1)?.type).toBe("error");
 		expect(calls).toHaveLength(1);
-		expect(state.getPool("test-router").failed).toEqual({});
+		expect(state.getProvider(PROVIDER_ID).failed).toEqual({});
 	});
 });
 
-describe("router: all members fail", () => {
-	it("passes the last error through and keeps the active member unchanged", async () => {
+describe("router: all keys fail", () => {
+	it("passes the last error through and keeps the active key unchanged", async () => {
 		const calls: DispatchCall[] = [];
 		const state = new StateStore(statePath);
-		const stream = createPoolStreamSimple({
-			pool: makePool(),
-			state,
-			dispatch: fakeDispatch([
+		const stream = makeRouter(
+			[
 				{ kind: "preContentError", status: 429, message: "first failure" },
 				{ kind: "preContentError", status: 500, message: "second failure" },
-			], calls),
-		});
-		const events = await collect(stream(routerModel(), CONTEXT, undefined));
+			],
+			calls,
+			makeEntry(),
+			state,
+		);
+		const events = await collect(stream(testModel(), CONTEXT, { apiKey: ORIGINAL_KEY }));
 
 		const last = events.at(-1);
 		expect(last?.type).toBe("error");
 		expect(last && "error" in last ? last.error.errorMessage : "").toBe("second failure");
-		expect(calls.map((c) => c.provider)).toEqual(["member-a", "member-b"]);
+		expect(calls.map((c) => c.apiKey)).toEqual([ORIGINAL_KEY, EXTRA_KEY_1]);
 
-		const persisted = state.getPool("test-router");
+		const persisted = state.getProvider(PROVIDER_ID);
 		expect(persisted.active).toBeUndefined();
-		expect(persisted.failed["member-a"]?.reason).toBe("429");
-		expect(persisted.failed["member-b"]?.reason).toBe("500");
+		expect(persisted.failed["0"]?.reason).toBe("429");
+		expect(persisted.failed["1"]?.reason).toBe("500");
 	});
 });
 
-describe("router: model routing", () => {
-	it("routes a copy of the model with the member's provider, baseUrl and api", async () => {
-		const seen: Array<{ provider: string; baseUrl: string; api: string }> = [];
+describe("router: guard rails", () => {
+	it("falls back to key index 0 when the persisted active index is stale", async () => {
 		const state = new StateStore(statePath);
-		const dispatch = (model: Model<Api>): AssistantMessageEventStream => {
-			seen.push({ provider: model.provider, baseUrl: model.baseUrl, api: model.api });
-			const stream = createAssistantMessageEventStream();
-			queueMicrotask(() => {
-				const partial = makeMessage(model.provider);
-				stream.push({ type: "start", partial });
-				stream.push({ type: "done", reason: "stop", message: partial });
-				stream.end();
-			});
-			return stream;
-		};
-		const pool = makePool({ members: [{ ...MEMBER_B, api: "anthropic-messages" as Api, baseUrl: "https://b.example.com/anthropic" }] });
-		const stream = createPoolStreamSimple({ pool, state, dispatch });
-		await collect(stream(routerModel(), CONTEXT, undefined));
-		expect(seen).toEqual([{ provider: "member-b", baseUrl: "https://b.example.com/anthropic", api: "anthropic-messages" }]);
+		state.update((data) => {
+			data.providers[PROVIDER_ID] = { active: 7, failed: {} };
+		});
+		const calls: DispatchCall[] = [];
+		const stream = makeRouter([{ kind: "success" }], calls, makeEntry(), state);
+		await collect(stream(testModel(), CONTEXT, { apiKey: ORIGINAL_KEY }));
+		expect(calls.map((c) => c.apiKey)).toEqual([ORIGINAL_KEY]);
+	});
+
+	it("emits an error event instead of hanging when no key is available", async () => {
+		const calls: DispatchCall[] = [];
+		const stream = makeRouter([], calls, makeEntry([]));
+		const events = await collect(stream(testModel(), CONTEXT, {}));
+		expect(calls).toHaveLength(0);
+		const last = events.at(-1);
+		expect(last?.type).toBe("error");
+		expect(last && "error" in last ? last.error.errorMessage : "").toContain("no key available");
 	});
 });

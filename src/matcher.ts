@@ -3,7 +3,7 @@
  * failed and allow failover to the next member.
  */
 
-import type { TriggerConfig } from "./config.ts";
+import type { TriggerConfig } from "./pool-file.ts";
 
 export interface TriggerInput {
 	/** HTTP status captured via onResponse, if the request got that far. */

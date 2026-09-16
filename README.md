@@ -1,125 +1,94 @@
 # pi-more-keys
 
-通用 [pi](https://github.com/earendil-works/pi-mono) extension：让**任意** api_key 模式的 provider 支持多 key 故障自动切换，并把切换状态持久化，pi 重启后不再每次都先打失败的 key。
+零配置多 key 故障切换 [pi](https://github.com/earendil-works/pi-mono) extension。加 provider 的方式完全不变（`models.json` + `/login`），只要执行一句 `/add-more-key my-kimi` 粘贴备用 key，这个 provider 就获得多 key 自动故障切换，切换状态持久化，pi 重启后不会再先打失败的 key。
 
-零硬编码：provider 名、模型、命令行为全部由配置声明。任何 provider（内置或 `models.json` 自定义）只要每个成员有独立 key，就能组成 key 池。
-
-## 工作原理
-
-- 你在 `pi-more-keys.json` 里声明一个 **pool**：一个 router provider id + 若干成员 provider id（按优先级排序）。
-- extension 用 `pi.registerProvider()` 动态注册 router provider，模型列表复制自第一个成员。
-- 请求打到 router 模型时，router 用当前 active 成员的 key、baseUrl、api 发请求（经 pi-ai 兼容层分发，成员间 api/baseUrl 可以不同）。
-- 命中触发条件（HTTP 状态码或错误关键词）且**尚未产生任何输出**时：标记该成员失败并持久化 → 自动用下一成员重试 → 成功后 active 切换并持久化。
-- 已产生部分输出后**绝不**换 key 重试（避免重复内容）；错误原样透传。
-- 所有成员都失败：透传最后一次错误，active 不变。
-- 每次尝试强制 `maxRetries: 0`，底层 SDK 不会在 router 背后自行重试。
-
-## 安装
+## 使用
 
 ```bash
-# 克隆后软链（或复制）到 pi 全局 extension 目录
+# 安装：软链（或复制）到 pi 全局 extension 目录
 ln -s /path/to/pi-more-keys ~/.pi/agent/extensions/pi-more-keys
-
-# 开发依赖（仅测试/类型检查需要；运行时 pi 会解析自身模块）
-npm install
 ```
+
+然后在 pi 里：
+
+```
+/add-more-key my-kimi      # 弹窗粘贴备用 key（不会进入会话历史）
+/more-keys                 # 查看：my-kimi: 2 keys, active=#0
+/more-keys-reset my-kimi   # 清失败记录，切回原 key
+```
+
+就这么多。没有要手写的配置文件。
 
 要求 pi ≥ 0.85.1。
 
-## 配置
+## 工作原理
 
-创建 `~/.pi/agent/pi-more-keys.json`（非敏感，不放任何 key）：
+- `/add-more-key` 校验：provider 存在 → 其 api 可被 pi-ai 分发 → 原 key 可解析（`/login` 或 models.json `apiKey`）；任一不满足会明确提示原因且不写任何文件。
+- 备用 key 追加到 `~/.pi/agent/pi-more-keys.json`（0600），并立即对运行中的会话生效。
+- extension 对有备用 key 的 provider 用 `pi.registerProvider()` **只覆盖 streamSimple**（merge 语义，models.json 的 models/baseUrl 原样保留）。
+- 请求进来 → 用 active key 打原 endpoint（key 列表 = 原 key + extraKeys，同 provider 同 endpoint，只换 key）。
+- 命中触发条件（默认 HTTP 401/403/408/409/429/500/502/503/504，或自定义错误关键词）且**尚未产生任何输出**：标记该 key 失败并持久化 → 换下一个 key 重试 → 成功后 active 切换并持久化。
+- 已产生部分输出后**绝不**换 key 重试（避免重复内容），错误原样透传；所有 key 都失败则透传最后一次错误，active 不变。
+- 每次尝试强制 `maxRetries: 0`，底层 SDK 不会在 router 背后自行重试。
 
-```json
-{
-  "version": 1,
-  "pools": {
-    "kimi-pool": {
-      "members": ["my-kimi", "my-kimi-backup"],
-      "trigger": {
-        "httpStatuses": [401, 403, 408, 409, 429, 500, 502, 503, 504],
-        "errorKeywords": ["rate limit"],
-        "caseInsensitive": true
-      },
-      "maxAlternateAttempts": 1,
-      "switchBack": { "mode": "manual" }
-    }
-  }
-}
-```
+active key 与失败记录存 `~/.pi/agent/pi-more-keys-state.json`（原子写入，损坏自动隔离恢复）。**状态文件只存 key 序号，不存 key 本体。**
 
-| 字段 | 说明 | 默认 |
-|---|---|---|
-| `members` | `models.json` 中已存在的 provider id，按优先级排序，数量不限 | 必填 |
-| `trigger.httpStatuses` | 触发切换的 HTTP 状态码 | `[401, 403, 408, 409, 429, 500, 502, 503, 504]` |
-| `trigger.errorKeywords` | 触发切换的错误消息子串 | `[]` |
-| `trigger.caseInsensitive` | 关键词匹配是否忽略大小写 | `true` |
-| `maxAlternateAttempts` | active 失败后最多再试几个备用成员 | `1` |
-| `switchBack.mode` | 切回主 key 方式，目前仅支持 `"manual"` | `"manual"` |
+## key 池文件（一般不需要手改）
 
-### 示例：my-kimi 双 key
-
-`~/.pi/agent/models.json` 声明两个成员 provider（同 endpoint 或不同 endpoint 均可）：
+`~/.pi/agent/pi-more-keys.json`（0600）：
 
 ```json
 {
   "providers": {
     "my-kimi": {
-      "baseUrl": "https://api.example.com/v1",
-      "api": "openai-responses",
-      "models": [{ "id": "k3", "name": "K3", "reasoning": true, "input": ["text", "image"], "contextWindow": 1048576, "maxTokens": 131072 }]
-    },
-    "my-kimi-backup": {
-      "baseUrl": "https://api.example.com/v1",
-      "api": "openai-responses",
-      "models": [{ "id": "k3", "name": "K3 (backup)", "reasoning": true, "input": ["text", "image"], "contextWindow": 1048576, "maxTokens": 131072 }]
+      "extraKeys": ["..."],
+      "trigger": {
+        "httpStatuses": [401, 403, 408, 409, 429, 500, 502, 503, 504],
+        "errorKeywords": [],
+        "caseInsensitive": true
+      }
     }
   }
 }
 ```
 
-每个成员的 key 放 `~/.pi/agent/auth.json`（`pi /login <provider>` 写入，或手动按 `{"<provider>": {"type": "api_key", "key": "..."}}` 格式）。也支持在成员 provider 的 `models.json` `apiKey` 字段里用 pi 的值语法（`$ENV_VAR`、`!command`、字面量）作为 fallback。
-
-配置后 `pi --list-models kimi-pool` 即可看到路由模型（复制自 `members[0]`），在 pi 里 `/model` 选择 `kimi-pool/k3` 使用。
+`trigger` 可省略（用默认值），也可按 provider 自定义触发状态码 / 错误消息关键词。
 
 ## 命令
 
 | 命令 | 作用 |
 |---|---|
-| `/more-keys` | 显示各 pool 的 active 成员与失败记录 |
-| `/more-keys-use <pool> <member>` | 手动切换 active 成员（即切回主 key 的手段），同时清除该成员的失败记录 |
-| `/more-keys-reset <pool>` | 清空失败记录并切回 `members[0]` |
-
-## 状态文件
-
-`~/.pi/agent/pi-more-keys-state.json`：记录每个 pool 的 active 成员与失败记录（原因 + 时间戳）。原子写入（tmp + rename）；文件损坏时自动隔离为 `.corrupt` 并从空状态恢复。只含 provider id 与状态码等元信息，**绝不含 key**。
+| `/add-more-key <provider-id>` | 弹窗收一个备用 key 加入该 provider 的 key 池，立即生效 |
+| `/more-keys` | 各 provider 的 key 数量、当前 active 序号、失败记录 |
+| `/more-keys-reset <provider-id>` | 清失败记录并切回原 key（#0） |
 
 ## 安全
 
-- key 仅从 `auth.json` / `models.json` 读入进程内存，用于请求注入。
-- 日志、状态文件、错误消息、session 条目均不出现 key。
+- 原 key 由 pi 自身解析注入（auth.json / 环境变量 / models.json），extension 不复制不转发。
+- 备用 key 只写入 `pi-more-keys.json`（0600）与进程内存；日志、状态文件、错误消息、会话条目均不出现 key。
+- key 通过 UI 弹窗收集，不从命令参数读取，避免进入会话历史。
 
 ## 限制
 
-- 仅支持 api_key 模式成员；OAuth 成员不参与池。
+- 仅支持 api_key 模式 provider；OAuth provider 不适用。
+- provider 的 api 必须能被 pi-ai 兼容层分发（内置 api 类型均可）；不支持的 api 会被拒绝并在启动时跳过、提示。
 - 部分输出已产生后不重试，错误透传（防止重复内容）。
 - 非触发类错误（如 context overflow）不重试、不标记失败，交给 pi 自身恢复流程。
-- `switchBack` 目前仅 `manual`：主 key 恢复后用 `/more-keys-use` 或 `/more-keys-reset` 切回。
-- router 模型列表复制自第一个成员；成员间模型能力差异由使用者保证。
+- 主 key 恢复后用 `/more-keys-reset` 切回（暂无自动回切）。
 
 ## 开发
 
 ```bash
-npm test        # vitest：matcher / state / router
+npm install
+npm test        # vitest：matcher / pool-file / state / router / add-key（51 个用例）
 npm run build   # tsc --noEmit 类型检查
 ```
 
 目录结构：
 
-- `index.ts` — extension 入口（注册 provider 与命令）
-- `src/config.ts` — 配置加载与校验
+- `index.ts` — extension 入口（启动覆盖注册 + 三个命令）
+- `src/pool-file.ts` — key 池文件读写（0600、原子写、trigger 校验）
+- `src/router.ts` — 故障切换核心（streamSimple 覆盖实现）
+- `src/state.ts` — active/失败状态持久化（按 key 序号）
 - `src/matcher.ts` — 触发条件匹配
-- `src/state.ts` — 状态持久化（原子写、损坏恢复）
-- `src/keys.ts` — 成员 key 解析（auth.json / models.json 值语法）
-- `src/models-file.ts` — models.json 读取
-- `src/router.ts` — 故障切换路由核心
+- `src/add-key.ts` — `/add-more-key` 校验与执行流程（依赖注入，可单测）

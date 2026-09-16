@@ -1,37 +1,44 @@
 /**
- * Persisted pool state for pi-more-keys.
+ * Persisted failover state for pi-more-keys.
  *
  * State file: ~/.pi/agent/pi-more-keys-state.json
- * - Written atomically (tmp file + rename) so a crash never leaves a torn file.
- * - Read through on every load() so commands and concurrent processes stay in sync.
- * - A corrupted file is quarantined to <path>.corrupt and state starts empty.
+ * {
+ *   "providers": {
+ *     "<provider-id>": {
+ *       "active": <key-index>,
+ *       "failed": { "<key-index>": { "reason": "429", "at": 0 } }
+ *     }
+ *   }
+ * }
  *
- * The state file never contains API keys — only provider ids, failure reasons
- * (HTTP status or keyword label) and timestamps.
+ * Keys are referenced by INDEX (0 = the provider's original key, 1..n =
+ * extraKeys from the pool file) so this file never contains any key material.
+ * Writes are atomic (tmp + rename); a corrupted file is quarantined to
+ * <path>.corrupt and state starts empty.
  */
 
 import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 
 export interface FailureRecord {
-	/** Why the member failed, e.g. "429" or 'keyword:"rate limit"'. */
+	/** Why the key failed, e.g. "429" or 'keyword:"rate limit"'. */
 	reason: string;
 	/** Epoch milliseconds when the failure was recorded. */
 	at: number;
 }
 
-export interface PoolState {
-	/** Currently active member id. Absent means "use members[0] from config". */
-	active?: string;
-	/** Members that failed recently, keyed by member id. */
+export interface ProviderState {
+	/** Index of the currently active key. Absent means 0 (the original key). */
+	active?: number;
+	/** Failed key indices, keyed by stringified index. */
 	failed: Record<string, FailureRecord>;
 }
 
 export interface StateData {
-	pools: Record<string, PoolState>;
+	providers: Record<string, ProviderState>;
 }
 
 function emptyState(): StateData {
-	return { pools: {} };
+	return { providers: {} };
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -40,26 +47,31 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 /** Coerce unknown parsed JSON into a valid StateData, dropping malformed entries. */
 export function sanitizeState(raw: unknown): StateData {
-	if (!isRecord(raw) || !isRecord(raw.pools)) {
+	if (!isRecord(raw) || !isRecord(raw.providers)) {
 		return emptyState();
 	}
-	const pools: Record<string, PoolState> = {};
-	for (const [poolId, poolRaw] of Object.entries(raw.pools)) {
-		if (!isRecord(poolRaw)) continue;
-		const pool: PoolState = { failed: {} };
-		if (typeof poolRaw.active === "string" && poolRaw.active.length > 0) {
-			pool.active = poolRaw.active;
+	const providers: Record<string, ProviderState> = {};
+	for (const [providerId, stateRaw] of Object.entries(raw.providers)) {
+		if (!isRecord(stateRaw)) continue;
+		const provider: ProviderState = { failed: {} };
+		if (
+			typeof stateRaw.active === "number" &&
+			Number.isInteger(stateRaw.active) &&
+			stateRaw.active >= 0
+		) {
+			provider.active = stateRaw.active;
 		}
-		if (isRecord(poolRaw.failed)) {
-			for (const [memberId, failureRaw] of Object.entries(poolRaw.failed)) {
+		if (isRecord(stateRaw.failed)) {
+			for (const [index, failureRaw] of Object.entries(stateRaw.failed)) {
+				if (!/^\d+$/.test(index)) continue;
 				if (!isRecord(failureRaw)) continue;
 				if (typeof failureRaw.reason !== "string" || typeof failureRaw.at !== "number") continue;
-				pool.failed[memberId] = { reason: failureRaw.reason, at: failureRaw.at };
+				provider.failed[index] = { reason: failureRaw.reason, at: failureRaw.at };
 			}
 		}
-		pools[poolId] = pool;
+		providers[providerId] = provider;
 	}
-	return { pools };
+	return { providers };
 }
 
 export class StateStore {
@@ -80,9 +92,9 @@ export class StateStore {
 		return sanitizeState(parsed);
 	}
 
-	getPool(poolId: string): PoolState {
+	getProvider(providerId: string): ProviderState {
 		const state = this.load();
-		return state.pools[poolId] ?? { failed: {} };
+		return state.providers[providerId] ?? { failed: {} };
 	}
 
 	/** Load, mutate, and atomically persist in one step. */

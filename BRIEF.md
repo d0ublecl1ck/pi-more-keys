@@ -1,5 +1,9 @@
 # pi-more-keys 任务简报
 
+> **⚠️ 方案已变更（v2，已实施）**：本文档描述的是初版「pool 配置」方案，已被零配置「覆盖式」方案取代。现行方案见 README.md：用户加 provider 方式不变，`/add-more-key <provider-id>` 弹窗收 key 即可；`pi-more-keys.json` 改为 key 池文件（0600，`{ providers: { "<id>": { extraKeys, trigger? } } }`），extension 用 `pi.registerProvider(id, { api, streamSimple })` merge 覆盖流实现（仅传 streamSimple 会被 pi 拒绝，api 必须重传）；router 成员 = [pi 注入的原 key, ...extraKeys]，同 provider 同 endpoint 只换 key；状态文件按 key 序号持久化。以下内容为历史存档。
+
+---
+
 ## 背景
 
 PI Coding Agent 支持自定义 provider（`models.json` + `auth.json` api_key 模式）。用户需要：**任何一个 key 模式的 provider，都可以配多个 key，主 key 失败后自动切换备用 key，切换状态持久化**。

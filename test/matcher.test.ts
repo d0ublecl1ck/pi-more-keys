@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { TriggerConfig } from "../src/config.ts";
+import type { TriggerConfig } from "../src/pool-file.ts";
 import { matchesTrigger } from "../src/matcher.ts";
 
 const base: TriggerConfig = {

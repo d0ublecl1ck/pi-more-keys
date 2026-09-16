@@ -1,177 +1,197 @@
 /**
- * pi-more-keys — generic multi-key failover for any api_key provider in pi.
+ * pi-more-keys — zero-config multi-key failover for any api_key provider in pi.
  *
- * Reads ~/.pi/agent/pi-more-keys.json, and for each configured pool registers
- * a router provider whose model list is copied from the pool's first member.
- * Requests to the router provider are served by the active member's key;
- * trigger failures (HTTP status / error keyword) fail over to the next member
- * and the switch is persisted to ~/.pi/agent/pi-more-keys-state.json.
+ * Users add providers the usual way (models.json + /login). One extra step —
+ * `/add-more-key <provider-id>` — pools an additional key, and from then on
+ * the provider's requests fail over across all pooled keys on trigger errors
+ * (HTTP status / error keyword), with the active key persisted across
+ * restarts in ~/.pi/agent/pi-more-keys-state.json.
+ *
+ * How it works: for every provider with pooled extra keys this extension
+ * overrides ONLY streamSimple via pi.registerProvider() (merge semantics:
+ * models.json models/baseUrl stay intact). The override replays the request
+ * against the same endpoint with each pooled key until one succeeds.
+ *
+ * Keys live in ~/.pi/agent/pi-more-keys.json (mode 0600) and process memory.
+ * They are never logged, printed, or written anywhere else; the state file
+ * records key INDICES only.
  *
  * Commands:
- *   /more-keys                    show pools, active member, failure records
- *   /more-keys-use <pool> <member>  switch the active member manually
- *   /more-keys-reset <pool>       clear failure records, switch back to members[0]
- *
- * API keys are only read into process memory from auth.json / models.json.
- * They are never logged, printed, or written to any file by this extension.
+ *   /add-more-key <provider-id>   pool an extra key (prompted via UI dialog)
+ *   /more-keys                    show key counts, active key index, failures
+ *   /more-keys-reset <provider>   clear failure records, switch back to key #0
  */
 
-import { existsSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { streamSimple as dispatch } from "@earendil-works/pi-ai/compat";
+import { getApiProvider, streamSimple as dispatch } from "@earendil-works/pi-ai/compat";
 import type { Api } from "@earendil-works/pi-ai";
-import type { ExtensionAPI, ProviderModelConfig } from "@earendil-works/pi-coding-agent";
-import { loadConfig, type PoolConfig } from "./src/config.ts";
-import { escapeConfigValueLiteral, resolveConfigValue, resolveMemberKey } from "./src/keys.ts";
-import { loadModelsFile, type ModelsFileModel, type ModelsFileProvider } from "./src/models-file.ts";
-import { createPoolStreamSimple, type PoolMember } from "./src/router.ts";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { runAddKeyFlow } from "./src/add-key.ts";
+import { KeyPoolStore, loadPoolFile } from "./src/pool-file.ts";
+import { createKeyPoolStream } from "./src/router.ts";
 import { StateStore } from "./src/state.ts";
 
-const ZERO_COST = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
-
-interface RegisteredPool {
-	id: string;
-	config: PoolConfig;
-	members: PoolMember[];
+/** Minimal models.json read: provider id -> api, for startup-time dispatchability checks. */
+function readModelsFileApis(path: string): Record<string, string> {
+	try {
+		const parsed = JSON.parse(readFileSync(path, "utf8")) as unknown;
+		if (typeof parsed !== "object" || parsed === null) return {};
+		const providers = (parsed as Record<string, unknown>).providers;
+		if (typeof providers !== "object" || providers === null) return {};
+		const apis: Record<string, string> = {};
+		for (const [id, def] of Object.entries(providers as Record<string, { api?: unknown }>)) {
+			if (typeof def?.api === "string") apis[id] = def.api;
+		}
+		return apis;
+	} catch {
+		return {};
+	}
 }
 
-function toProviderModelConfig(model: ModelsFileModel, provider: ModelsFileProvider): ProviderModelConfig {
-	return {
-		id: model.id,
-		name: model.name ?? model.id,
-		...(model.api ?? provider.api ? { api: (model.api ?? provider.api) as Api } : {}),
-		...(model.baseUrl ?? provider.baseUrl ? { baseUrl: model.baseUrl ?? provider.baseUrl } : {}),
-		reasoning: model.reasoning ?? false,
-		...(model.thinkingLevelMap
-			? { thinkingLevelMap: model.thinkingLevelMap as ProviderModelConfig["thinkingLevelMap"] }
-			: {}),
-		input: model.input ?? ["text"],
-		cost: model.cost ?? ZERO_COST,
-		contextWindow: model.contextWindow ?? 128000,
-		maxTokens: model.maxTokens ?? 8192,
-		...(model.headers ? { headers: model.headers } : {}),
-		...(model.compat ? { compat: model.compat as ProviderModelConfig["compat"] } : {}),
-	};
+/** The api a provider's models run on, via the live model registry. */
+function apiFromRegistry(ctx: ExtensionContext, providerId: string): string | undefined {
+	return ctx.modelRegistry.getProvider(providerId)?.getModels()[0]?.api;
 }
 
 export default async function piMoreKeys(pi: ExtensionAPI): Promise<void> {
 	const agentDir = process.env.PI_MORE_KEYS_AGENT_DIR ?? join(homedir(), ".pi", "agent");
-	const configPath = join(agentDir, "pi-more-keys.json");
-	if (!existsSync(configPath)) {
-		// No pools configured: extension is a no-op.
-		return;
-	}
-
-	const warnings: string[] = [];
-	let config;
-	try {
-		config = loadConfig(configPath);
-	} catch (error) {
-		warnings.push(error instanceof Error ? error.message : String(error));
-		config = { version: 1 as const, pools: {} };
-	}
-
-	const modelsFile = loadModelsFile(join(agentDir, "models.json"));
-	const authPath = join(agentDir, "auth.json");
+	const poolPath = join(agentDir, "pi-more-keys.json");
+	const { data, warnings } = loadPoolFile(poolPath);
+	const store = new KeyPoolStore(poolPath, data);
 	const state = new StateStore(join(agentDir, "pi-more-keys-state.json"));
-	const pools: RegisteredPool[] = [];
 
-	for (const [routerId, poolConfig] of Object.entries(config.pools)) {
-		const members: PoolMember[] = [];
-		for (const memberId of poolConfig.members) {
-			const def = modelsFile.providers[memberId];
-			if (!def) {
-				warnings.push(`pool "${routerId}": member "${memberId}" not found in models.json, skipped`);
-				continue;
-			}
-			const apiKey = resolveMemberKey(memberId, { authPath, providerApiKey: def.apiKey });
-			if (!apiKey) {
-				warnings.push(`pool "${routerId}": no API key for member "${memberId}" (auth.json or models.json), skipped`);
-				continue;
-			}
-			const headers = def.headers
-				? Object.fromEntries(
-						Object.entries(def.headers)
-							.map(([k, v]) => [k, resolveConfigValue(v)] as const)
-							.filter((entry): entry is readonly [string, string] => entry[1] !== undefined),
-					)
-				: undefined;
-			members.push({
-				id: memberId,
-				apiKey,
-				...(def.baseUrl ? { baseUrl: def.baseUrl } : {}),
-				...(def.api ? { api: def.api as Api } : {}),
-				...(headers && Object.keys(headers).length > 0 ? { headers } : {}),
-			});
-		}
+	const overridden = new Set<string>();
+	const startupWarnings = [...warnings];
+	/** Providers with pooled keys whose api could not be checked at factory time. */
+	const deferred: string[] = [];
 
-		if (members.length === 0) {
-			warnings.push(`pool "${routerId}": no usable members, router provider not registered`);
-			continue;
-		}
-
-		// Model metadata is copied from the first config member that exists in models.json.
-		const modelSourceId =
-			poolConfig.members.find((id) => (modelsFile.providers[id]?.models?.length ?? 0) > 0) ?? members[0]!.id;
-		const modelSource = modelsFile.providers[modelSourceId]!;
-		const routerModels = (modelSource.models ?? []).map((m) => toProviderModelConfig(m, modelSource));
-		if (routerModels.length === 0) {
-			warnings.push(`pool "${routerId}": member "${modelSourceId}" declares no models, router provider not registered`);
-			continue;
-		}
-		const routerApi = (modelSource.api ?? routerModels[0]!.api) as Api | undefined;
-		if (!routerApi || !modelSource.baseUrl) {
-			warnings.push(`pool "${routerId}": member "${modelSourceId}" needs baseUrl and api, router provider not registered`);
-			continue;
-		}
-
-		const pool: RegisteredPool = { id: routerId, config: poolConfig, members };
-		pools.push(pool);
-
-		pi.registerProvider(routerId, {
-			name: routerId,
-			baseUrl: modelSource.baseUrl,
-			api: routerApi,
-			// Marks the provider as having auth so models are listed/usable. The
-			// router overrides the key per attempt; escaped so pi's config value
-			// resolution returns it unchanged.
-			apiKey: escapeConfigValueLiteral(members[0]!.apiKey),
-			models: routerModels,
-			streamSimple: createPoolStreamSimple({
-				pool: {
-					id: routerId,
-					members,
-					trigger: poolConfig.trigger,
-					maxAlternateAttempts: poolConfig.maxAlternateAttempts,
-				},
+	/** Register the streamSimple override for a provider (idempotent, immediate effect). */
+	const ensureOverride = (providerId: string, api: string): void => {
+		if (overridden.has(providerId)) return;
+		pi.registerProvider(providerId, {
+			// registerProvider merges; models.json models/baseUrl are preserved.
+			// api must be re-passed because pi requires it alongside streamSimple.
+			api: api as Api,
+			streamSimple: createKeyPoolStream({
+				providerId,
+				getEntry: () => store.getEntry(providerId),
 				state,
 				dispatch,
 			}),
 		});
+		overridden.add(providerId);
+	};
+
+	// Startup pass: override every pooled provider whose api is known from models.json.
+	const modelsApis = readModelsFileApis(join(agentDir, "models.json"));
+	for (const [providerId, entry] of Object.entries(store.providers)) {
+		if (entry.extraKeys.length === 0) continue;
+		const api = modelsApis[providerId];
+		if (!api) {
+			deferred.push(providerId);
+			continue;
+		}
+		// Double-check dispatchability before overriding: unsupported apis are skipped.
+		if (!getApiProvider(api as Api)) {
+			startupWarnings.push(
+				`provider "${providerId}" uses api "${api}" which is not dispatchable; failover disabled for it`,
+			);
+			continue;
+		}
+		try {
+			ensureOverride(providerId, api);
+		} catch (error) {
+			startupWarnings.push(
+				`failed to override provider "${providerId}": ${error instanceof Error ? error.message : String(error)}`,
+			);
+		}
 	}
 
+	pi.on("session_start", (_event, ctx) => {
+		for (const warning of startupWarnings) {
+			ctx.ui.notify(`pi-more-keys: ${warning}`, "warning");
+		}
+		// Backstop for providers not in models.json (e.g. built-ins): check the
+		// api via the live model registry and register the override now.
+		for (const providerId of deferred) {
+			const entry = store.getEntry(providerId);
+			if (!entry || entry.extraKeys.length === 0 || overridden.has(providerId)) continue;
+			const api = apiFromRegistry(ctx, providerId);
+			if (!api) {
+				ctx.ui.notify(
+					`pi-more-keys: cannot determine api for provider "${providerId}"; failover disabled for it`,
+					"warning",
+				);
+				continue;
+			}
+			if (!getApiProvider(api as Api)) {
+				ctx.ui.notify(
+					`pi-more-keys: provider "${providerId}" uses api "${api}" which is not dispatchable; failover disabled for it`,
+					"warning",
+				);
+				continue;
+			}
+			try {
+				ensureOverride(providerId, api);
+			} catch (error) {
+				ctx.ui.notify(
+					`pi-more-keys: failed to override provider "${providerId}": ${error instanceof Error ? error.message : String(error)}`,
+					"error",
+				);
+			}
+		}
+	});
+
+	pi.registerCommand("add-more-key", {
+		description: "Pool an extra API key for a provider (failover): /add-more-key <provider-id>",
+		handler: async (args, ctx) => {
+			await runAddKeyFlow({
+				providerId: args,
+				getProviderApi: (id) => apiFromRegistry(ctx, id),
+				isApiDispatchable: (api) => getApiProvider(api as Api) !== undefined,
+				getOriginalKey: (id) => ctx.modelRegistry.getApiKeyForProvider(id),
+				// Key is collected via UI dialog, never from command args, so it
+				// does not end up in session history.
+				promptKey: () =>
+					ctx.ui.input(
+						`Add extra API key for ${args.trim()}`,
+						"paste the key — stored in pi-more-keys.json (0600), never logged",
+					),
+				getExtraKeys: (id) => store.getEntry(id)?.extraKeys ?? [],
+				addKey: (id, key) => store.addExtraKey(id, key),
+				ensureOverride,
+				notify: (message, type) => ctx.ui.notify(message, type),
+			});
+		},
+	});
+
 	pi.registerCommand("more-keys", {
-		description: "Show pi-more-keys pools: active member and failure records",
+		description: "Show pooled providers: key count, active key index, failure records",
 		handler: async (_args, ctx) => {
-			if (pools.length === 0) {
-				ctx.ui.notify("pi-more-keys: no pools registered (check config and warnings)", "warning");
+			const providerIds = Object.keys(store.providers);
+			if (providerIds.length === 0) {
+				ctx.ui.notify("pi-more-keys: no extra keys pooled yet — use /add-more-key <provider-id>", "info");
 				return;
 			}
 			const lines: string[] = [];
-			for (const pool of pools) {
-				const poolState = state.getPool(pool.id);
+			for (const providerId of providerIds) {
+				const entry = store.getEntry(providerId)!;
+				const totalKeys = 1 + entry.extraKeys.length;
+				const providerState = state.getProvider(providerId);
 				const active =
-					poolState.active && pool.members.some((m) => m.id === poolState.active)
-						? poolState.active
-						: pool.members[0]!.id;
-				lines.push(`${pool.id}: active=${active} members=[${pool.members.map((m) => m.id).join(", ")}]`);
-				const failures = Object.entries(poolState.failed);
+					providerState.active !== undefined && providerState.active < totalKeys
+						? providerState.active
+						: 0;
+				const suffix = overridden.has(providerId) ? "" : " (override not active)";
+				lines.push(`${providerId}: ${totalKeys} keys, active=#${active}${suffix}`);
+				const failures = Object.entries(providerState.failed);
 				if (failures.length === 0) {
 					lines.push("  no failure records");
 				} else {
-					for (const [memberId, failure] of failures) {
-						lines.push(`  failed: ${memberId} reason=${failure.reason} at=${new Date(failure.at).toISOString()}`);
+					for (const [index, failure] of failures) {
+						lines.push(`  key #${index} failed: reason=${failure.reason} at=${new Date(failure.at).toISOString()}`);
 					}
 				}
 			}
@@ -179,50 +199,18 @@ export default async function piMoreKeys(pi: ExtensionAPI): Promise<void> {
 		},
 	});
 
-	pi.registerCommand("more-keys-use", {
-		description: "Switch a pool's active member: /more-keys-use <pool> <member>",
-		handler: async (args, ctx) => {
-			const [poolId, memberId] = args.trim().split(/\s+/);
-			const pool = pools.find((p) => p.id === poolId);
-			if (!pool || !memberId) {
-				ctx.ui.notify("usage: /more-keys-use <pool> <member>", "warning");
-				return;
-			}
-			if (!pool.members.some((m) => m.id === memberId)) {
-				ctx.ui.notify(`pool "${poolId}" has no member "${memberId}"`, "error");
-				return;
-			}
-			state.update((data) => {
-				const p = (data.pools[poolId!] ??= { failed: {} });
-				p.active = memberId;
-				delete p.failed[memberId!];
-			});
-			ctx.ui.notify(`pool "${poolId}": active switched to ${memberId}`, "info");
-		},
-	});
-
 	pi.registerCommand("more-keys-reset", {
-		description: "Clear a pool's failure records and switch back to its first member: /more-keys-reset <pool>",
+		description: "Clear a provider's failure records and switch back to its original key: /more-keys-reset <provider-id>",
 		handler: async (args, ctx) => {
-			const poolId = args.trim();
-			const pool = pools.find((p) => p.id === poolId);
-			if (!pool) {
-				ctx.ui.notify(`unknown pool "${poolId}"`, "error");
+			const providerId = args.trim();
+			if (!store.getEntry(providerId)) {
+				ctx.ui.notify(`pi-more-keys: no key pool for provider "${providerId}"`, "error");
 				return;
 			}
-			const first = pool.members[0]!.id;
 			state.update((data) => {
-				data.pools[poolId] = { active: first, failed: {} };
+				data.providers[providerId] = { active: 0, failed: {} };
 			});
-			ctx.ui.notify(`pool "${poolId}": reset, active=${first}`, "info");
+			ctx.ui.notify(`pi-more-keys: "${providerId}" reset, active key #0`, "info");
 		},
 	});
-
-	if (warnings.length > 0) {
-		pi.on("session_start", (_event, ctx) => {
-			for (const warning of warnings) {
-				ctx.ui.notify(`pi-more-keys: ${warning}`, "warning");
-			}
-		});
-	}
 }
