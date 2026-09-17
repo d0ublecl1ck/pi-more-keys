@@ -38,6 +38,7 @@ function makeHarness(overrides?: Partial<AddKeyFlowDeps>): Harness {
 		getCurrentProvider: () => "current-provider",
 		getProviderApi: () => "openai-completions",
 		isApiDispatchable: () => true,
+		isOAuth: () => false,
 		getOriginalKey: async () => ORIGINAL_KEY,
 		promptKey: async () => NEW_KEY,
 		getExtraKeys: (id) => store.getEntry(id)?.extraKeys ?? [],
@@ -64,6 +65,19 @@ describe("runAddKeyFlow: validation rejections write nothing", () => {
 		const result = await runAddKeyFlow(h.deps);
 		expect(result).toEqual({ added: false, reason: "undispatchable-api" });
 		expect(h.notifications.at(-1)?.message).toContain("openai-completions");
+		expect(h.overrides).toEqual([]);
+		expect(h.store.providers).toEqual({});
+	});
+
+	it("rejects an OAuth provider before the original-key lookup", async () => {
+		const getOriginalKey = vi.fn(async () => ORIGINAL_KEY);
+		const h = makeHarness({ isOAuth: () => true, getOriginalKey });
+		const result = await runAddKeyFlow(h.deps);
+		expect(result).toEqual({ added: false, reason: "oauth-provider" });
+		expect(h.notifications.at(-1)?.message).toContain("OAuth");
+		expect(h.notifications.at(-1)?.message).toContain("api_key");
+		// Never falls through to the misleading "/login" branch.
+		expect(getOriginalKey).not.toHaveBeenCalled();
 		expect(h.overrides).toEqual([]);
 		expect(h.store.providers).toEqual({});
 	});

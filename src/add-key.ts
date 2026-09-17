@@ -21,6 +21,8 @@ export interface AddKeyFlowDeps {
 	getProviderApi: (providerId: string) => string | undefined;
 	/** Whether pi-ai compat can dispatch this api (getApiProvider(api) !== undefined). */
 	isApiDispatchable: (api: string) => boolean;
+	/** Whether the provider authenticates via OAuth (auth.json type or models.json oauth). */
+	isOAuth: (providerId: string) => boolean;
 	/** Resolve the provider's original key, or undefined when none is configured. */
 	getOriginalKey: (providerId: string) => Promise<string | undefined>;
 	/** Prompt for the new key (UI input dialog). Receives the resolved provider id. */
@@ -60,7 +62,7 @@ export async function runAddKeyFlow(deps: AddKeyFlowDeps): Promise<AddKeyFlowRes
 	const api = deps.getProviderApi(providerId);
 	if (api === undefined) {
 		deps.notify(
-			`pi-more-keys: unknown provider "${providerId}" (no models found). Add it to models.json first.`,
+			`pi-more-keys: unknown provider "${providerId}". Check the id via /model, or add it to models.json first.`,
 			"error",
 		);
 		return { added: false, reason: "unknown-provider" };
@@ -74,10 +76,21 @@ export async function runAddKeyFlow(deps: AddKeyFlowDeps): Promise<AddKeyFlowRes
 		return { added: false, reason: "undispatchable-api" };
 	}
 
+	// OAuth providers rotate tokens via /login, not api keys: reject before the
+	// original-key lookup so the user is not told to /login again (which would
+	// never yield an api_key for them).
+	if (deps.isOAuth(providerId)) {
+		deps.notify(
+			`pi-more-keys: provider "${providerId}" uses OAuth auth; multi-key failover only supports api_key providers. Nothing to add here.`,
+			"error",
+		);
+		return { added: false, reason: "oauth-provider" };
+	}
+
 	const originalKey = await deps.getOriginalKey(providerId);
 	if (!originalKey) {
 		deps.notify(
-			`pi-more-keys: no original key found for provider "${providerId}". Run /login ${providerId} or configure apiKey in models.json first.`,
+			`pi-more-keys: no API key found for provider "${providerId}". Run /login ${providerId}, set its env var, or configure apiKey in models.json first.`,
 			"error",
 		);
 		return { added: false, reason: "no-original-key" };

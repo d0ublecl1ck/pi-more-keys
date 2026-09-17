@@ -34,20 +34,40 @@ import { KeyPoolStore, loadPoolFile } from "./src/pool-file.ts";
 import { createKeyPoolStream } from "./src/router.ts";
 import { StateStore } from "./src/state.ts";
 
-/** Minimal models.json read: provider id -> api, for startup-time dispatchability checks. */
-function readModelsFileApis(path: string): Record<string, string> {
+interface ModelsFileProviderInfo {
+	api?: string;
+	oauth?: boolean;
+}
+
+/** Minimal models.json read: provider id -> { api, oauth }, for startup-time checks. */
+function readModelsFileProviderInfo(path: string): Record<string, ModelsFileProviderInfo> {
 	try {
 		const parsed = JSON.parse(readFileSync(path, "utf8")) as unknown;
 		if (typeof parsed !== "object" || parsed === null) return {};
 		const providers = (parsed as Record<string, unknown>).providers;
 		if (typeof providers !== "object" || providers === null) return {};
-		const apis: Record<string, string> = {};
-		for (const [id, def] of Object.entries(providers as Record<string, { api?: unknown }>)) {
-			if (typeof def?.api === "string") apis[id] = def.api;
+		const info: Record<string, ModelsFileProviderInfo> = {};
+		for (const [id, def] of Object.entries(providers as Record<string, { api?: unknown; oauth?: unknown }>)) {
+			info[id] = {
+				...(typeof def?.api === "string" ? { api: def.api } : {}),
+				...(def?.oauth !== undefined ? { oauth: true } : {}),
+			};
 		}
-		return apis;
+		return info;
 	} catch {
 		return {};
+	}
+}
+
+/** The auth.json credential type for a provider ("api_key" | "oauth" | ...), or undefined. */
+function readAuthType(path: string, providerId: string): string | undefined {
+	try {
+		const parsed = JSON.parse(readFileSync(path, "utf8")) as unknown;
+		if (typeof parsed !== "object" || parsed === null) return undefined;
+		const entry = (parsed as Record<string, { type?: unknown }>)[providerId];
+		return typeof entry?.type === "string" ? entry.type : undefined;
+	} catch {
+		return undefined;
 	}
 }
 
@@ -86,7 +106,14 @@ export default async function piMoreKeys(pi: ExtensionAPI): Promise<void> {
 	};
 
 	// Startup pass: override every pooled provider whose api is known from models.json.
-	const modelsApis = readModelsFileApis(join(agentDir, "models.json"));
+	const modelsInfo = readModelsFileProviderInfo(join(agentDir, "models.json"));
+	const modelsApis: Record<string, string> = {};
+	for (const [id, info] of Object.entries(modelsInfo)) {
+		if (info.api) modelsApis[id] = info.api;
+	}
+	const authPath = join(agentDir, "auth.json");
+	const isOAuthProvider = (providerId: string): boolean =>
+		readAuthType(authPath, providerId) === "oauth" || modelsInfo[providerId]?.oauth === true;
 	for (const [providerId, entry] of Object.entries(store.providers)) {
 		if (entry.extraKeys.length === 0) continue;
 		const api = modelsApis[providerId];
@@ -153,6 +180,7 @@ export default async function piMoreKeys(pi: ExtensionAPI): Promise<void> {
 				getCurrentProvider: () => ctx.model?.provider,
 				getProviderApi: (id) => apiFromRegistry(ctx, id),
 				isApiDispatchable: (api) => getApiProvider(api as Api) !== undefined,
+				isOAuth: isOAuthProvider,
 				getOriginalKey: (id) => ctx.modelRegistry.getApiKeyForProvider(id),
 				// Key is collected via UI dialog, never from command args, so it
 				// does not end up in session history.
