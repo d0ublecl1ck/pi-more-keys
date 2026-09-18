@@ -1,42 +1,75 @@
 # pi-more-keys
 
-零配置多 key 故障切换 [pi](https://github.com/earendil-works/pi-mono) extension。加 provider 的方式完全不变（`models.json` + `/login`），只要执行一句 `/add-more-key` 粘贴备用 key，当前正在用的 provider 就获得多 key 自动故障切换，切换状态持久化，pi 重启后不会再先打失败的 key。
+> One command — `/add-more-key` — gives any API-key provider in [pi](https://github.com/earendil-works/pi-mono) automatic multi-key failover. No config files to write, no new provider to set up.
 
-## 使用
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Requires pi ≥ 0.85.1](https://img.shields.io/badge/pi-%E2%89%A5%200.85.1-blue)](https://github.com/earendil-works/pi-mono)
+
+[中文文档](README.zh.md)
+
+A pi extension that lets you attach **extra API keys to the provider you are already using**. When the active key hits a rate limit or fails (401/429/5xx, configurable), the request transparently retries with the next key, and the switch is **persisted** — pi won't keep hammering the dead key on every request, even across restarts.
+
+## When you need it
+
+- Your provider key gets rate-limited (429) mid-session and you have a backup key, but switching means editing config and restarting.
+- You rotate between several keys for the same endpoint and want failover to be automatic, not manual.
+- You want the failover decision to survive pi restarts instead of re-tripping the same dead key every time.
+
+## Quick start
 
 ```bash
-# 安装：软链（或复制）到 pi 全局 extension 目录
-ln -s /path/to/pi-more-keys ~/.pi/agent/extensions/pi-more-keys
+# Install: symlink (or copy) into pi's global extension directory
+git clone https://github.com/d0ublecl1ck/pi-more-keys.git
+ln -s "$PWD/pi-more-keys" ~/.pi/agent/extensions/pi-more-keys
 ```
 
-然后在 pi 里：
+Then inside pi, with your model already selected (e.g. `my-kimi/k3`):
 
 ```
-/add-more-key              # 给当前会话正在用的 provider 加备用 key（弹窗粘贴，不进会话历史）
-/add-more-key my-kimi      # 或显式指定 provider（覆盖手段）
-/more-keys                 # 查看：my-kimi: 2 keys, active=#0
-/more-keys-reset my-kimi   # 清失败记录，切回原 key
+/add-more-key              # prompt pops up, paste a backup key for the CURRENT provider
+/more-keys                 # my-kimi: 2 keys, active=#0
+/more-keys-reset my-kimi   # clear failure records, switch back to the original key
 ```
 
-就这么多。没有要手写的配置文件。未选模型时 `/add-more-key`（无参数）会提示先用 `/model` 选模型。
+That's it. Your provider setup (`models.json` + `/login`) is untouched. No JSON to hand-edit.
 
-要求 pi ≥ 0.85.1。
+## Commands
 
-## 工作原理
+| Command | What it does |
+|---|---|
+| `/add-more-key [provider-id]` | Collects a backup key via a secure UI prompt and activates failover immediately. Without an argument, targets the provider of the current session's model. |
+| `/more-keys` | Shows per-provider key count, active key index, and failure records. |
+| `/more-keys-reset <provider-id>` | Clears failure records and switches back to the original key (#0). |
 
-- `/add-more-key` 校验：provider 存在（无参数时取当前会话模型的 provider）→ 其 api 可被 pi-ai 分发 → 原 key 可解析（`/login` 或 models.json `apiKey`）；任一不满足会明确提示原因且不写任何文件。
-- 备用 key 追加到 `~/.pi/agent/pi-more-keys.json`（0600），并立即对运行中的会话生效。
-- extension 对有备用 key 的 provider 用 `pi.registerProvider()` **只覆盖 streamSimple**（merge 语义，models.json 的 models/baseUrl 原样保留）。
-- 请求进来 → 用 active key 打原 endpoint（key 列表 = 原 key + extraKeys，同 provider 同 endpoint，只换 key）。
-- 命中触发条件（默认 HTTP 401/403/408/409/429/500/502/503/504，或自定义错误关键词）且**尚未产生任何输出**：标记该 key 失败并持久化 → 换下一个 key 重试 → 成功后 active 切换并持久化。
-- 已产生部分输出后**绝不**换 key 重试（避免重复内容），错误原样透传；所有 key 都失败则透传最后一次错误，active 不变。
-- 每次尝试强制 `maxRetries: 0`，底层 SDK 不会在 router 背后自行重试。
+## How it works
 
-active key 与失败记录存 `~/.pi/agent/pi-more-keys-state.json`（原子写入，损坏自动隔离恢复）。**状态文件只存 key 序号，不存 key 本体。**
+- `/add-more-key` validates first: the provider exists (defaults to the current session model's provider) → its API type is dispatchable by pi-ai → an original key is resolvable (from `/login` or `models.json`). If any check fails, it tells you exactly why and writes nothing.
+- Backup keys are appended to `~/.pi/agent/pi-more-keys.json` (mode `0600`) and take effect immediately in the running session.
+- For providers with backup keys, the extension overrides **only `streamSimple`** via `pi.registerProvider()` (merge semantics — your `models`/`baseUrl` in `models.json` stay intact).
+- Each request goes to the original endpoint with the active key (key list = original key + extraKeys; same provider, same endpoint, only the key changes).
+- On a trigger (default HTTP 401/403/408/409/429/500/502/503/504, or custom error keywords) **before any output was produced**: the key is marked failed and persisted → the request retries with the next key → on success the new active key is persisted.
+- Once partial output has been produced, failover is **never** attempted (it would duplicate content); the error passes through. If every key fails, the last error passes through and the active key stays unchanged.
+- Every attempt forces `maxRetries: 0`, so the underlying SDK never retries behind the router's back.
 
-## key 池文件（一般不需要手改）
+The active key index and failure records live in `~/.pi/agent/pi-more-keys-state.json` (atomic writes, corruption-safe recovery). **The state file stores key indices, never the keys themselves.**
 
-`~/.pi/agent/pi-more-keys.json`（0600）：
+## Security
+
+- The original key is resolved and injected by pi itself (auth.json / env var / models.json); the extension never copies or forwards it.
+- Backup keys only ever touch `pi-more-keys.json` (`0600`) and process memory — never logs, state files, error messages, or session entries.
+- Keys are collected through a UI prompt, not command arguments, so they never land in session history.
+
+## Limitations
+
+- API-key providers only; OAuth providers are rejected with an explicit message.
+- The provider's API type must be dispatchable by pi-ai's compat layer (all built-in API types qualify); unsupported providers are refused and skipped with a notice.
+- No retry after partial output (prevents duplicated content).
+- Non-trigger errors (e.g. context overflow) are neither retried nor marked failed — they go to pi's own recovery flow.
+- Switching back to a recovered primary key is manual (`/more-keys-reset`); automatic probe-back is not implemented yet.
+
+## Advanced: trigger configuration
+
+The key pool file `~/.pi/agent/pi-more-keys.json` (`0600`) normally needs no hand-editing, but triggers are configurable per provider:
 
 ```json
 {
@@ -53,43 +86,25 @@ active key 与失败记录存 `~/.pi/agent/pi-more-keys-state.json`（原子写�
 }
 ```
 
-`trigger` 可省略（用默认值），也可按 provider 自定义触发状态码 / 错误消息关键词。
+`trigger` is optional (defaults shown above) and can be customized per provider.
 
-## 命令
-
-| 命令 | 作用 |
-|---|---|
-| `/add-more-key [provider-id]` | 弹窗收一个备用 key 加入 key 池，立即生效；不带参数时作用于当前会话模型的 provider |
-| `/more-keys` | 各 provider 的 key 数量、当前 active 序号、失败记录 |
-| `/more-keys-reset <provider-id>` | 清失败记录并切回原 key（#0） |
-
-## 安全
-
-- 原 key 由 pi 自身解析注入（auth.json / 环境变量 / models.json），extension 不复制不转发。
-- 备用 key 只写入 `pi-more-keys.json`（0600）与进程内存；日志、状态文件、错误消息、会话条目均不出现 key。
-- key 通过 UI 弹窗收集，不从命令参数读取，避免进入会话历史。
-
-## 限制
-
-- 仅支持 api_key 模式 provider；OAuth provider 不适用。
-- provider 的 api 必须能被 pi-ai 兼容层分发（内置 api 类型均可）；不支持的 api 会被拒绝并在启动时跳过、提示。
-- 部分输出已产生后不重试，错误透传（防止重复内容）。
-- 非触发类错误（如 context overflow）不重试、不标记失败，交给 pi 自身恢复流程。
-- 主 key 恢复后用 `/more-keys-reset` 切回（暂无自动回切）。
-
-## 开发
+## Development
 
 ```bash
 npm install
-npm test        # vitest：matcher / pool-file / state / router / add-key（51 个用例）
-npm run build   # tsc --noEmit 类型检查
+npm test        # vitest: matcher / pool-file / state / router / add-key
+npm run build   # tsc --noEmit type check
 ```
 
-目录结构：
+Layout:
 
-- `index.ts` — extension 入口（启动覆盖注册 + 三个命令）
-- `src/pool-file.ts` — key 池文件读写（0600、原子写、trigger 校验）
-- `src/router.ts` — 故障切换核心（streamSimple 覆盖实现）
-- `src/state.ts` — active/失败状态持久化（按 key 序号）
-- `src/matcher.ts` — 触发条件匹配
-- `src/add-key.ts` — `/add-more-key` 校验与执行流程（依赖注入，可单测）
+- `index.ts` — extension entry (startup override registration + three commands)
+- `src/pool-file.ts` — key pool file I/O (`0600`, atomic writes, trigger validation)
+- `src/router.ts` — failover core (the `streamSimple` override)
+- `src/state.ts` — active/failed state persistence (by key index)
+- `src/matcher.ts` — trigger matching
+- `src/add-key.ts` — `/add-more-key` validation and execution flow (dependency-injected, unit-testable)
+
+## License
+
+[MIT](LICENSE)

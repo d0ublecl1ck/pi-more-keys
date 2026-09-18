@@ -1,8 +1,22 @@
 {
   "name": "pi-more-keys",
-  "private": true,
   "version": "0.1.0",
   "description": "Generic pi extension: multi-key failover pools with persisted state for any api_key provider",
+  "license": "MIT",
+  "author": "d0ublecl1ck",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/d0ublecl1ck/pi-more-keys.git"
+  },
+  "homepage": "https://github.com/d0ublecl1ck/pi-more-keys",
+  "keywords": [
+    "pi",
+    "pi-coding-agent",
+    "extension",
+    "api-key",
+    "failover",
+    "rate-limit"
+  ],
   "type": "module",
   "scripts": {
     "build": "tsc --noEmit",
