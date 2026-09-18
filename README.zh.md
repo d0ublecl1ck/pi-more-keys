@@ -83,7 +83,7 @@ active key 与失败记录存 `~/.pi/agent/pi-more-keys-state.json`（原子写�
 
 ```bash
 npm install
-npm test        # vitest：matcher / pool-file / state / router / add-key（51 个用例）
+npm test        # vitest：matcher / pool-file / state / router / add-key
 npm run build   # tsc --noEmit 类型检查
 ```
 
